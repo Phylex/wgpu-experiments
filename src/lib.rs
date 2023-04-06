@@ -15,6 +15,7 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: Window,
+    background_color: (f64, f64, f64, f64),
 }
 
 impl State {
@@ -75,6 +76,7 @@ impl State {
             queue,
             config,
             size,
+            background_color: (0.1, 0.2, 0.3, 1.0),
         }
     }
 
@@ -112,10 +114,10 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0 }),
+                            r: self.background_color.0,
+                            g: self.background_color.1,
+                            b: self.background_color.2,
+                            a: self.background_color.3 }),
                         store: true,
                     },
                 })],
@@ -175,6 +177,10 @@ pub async fn run() {
                     },
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                         state.resize(**new_inner_size);
+                    },
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.background_color.1 = position.x / state.config.height as f64;
+                        state.background_color.2 = position.y / state.config.width as f64;
                     },
                     _ => {}
                 }
