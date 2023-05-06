@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+use wgpu::util::DeviceExt;
 use wgpu::Features;
 use winit::{
     event::*,
@@ -8,8 +9,45 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+// Struct to hold the information of the vertices that we want to render
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+            // The below code uses a macro to do the thing we did by hand in the above definition
+            // attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        }
+    }
+}
+const VERTICES: &[Vertex] = &[
+    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
+];
+
 // structure to hold the state of the graphics system
 struct GrapicsSystem {
+    window: Window,
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -17,10 +55,12 @@ struct GrapicsSystem {
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     alternative_render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    num_vertices: u32,
     use_alternate_pipeline: bool,
-    window: Window,
     background_color: (f64, f64, f64, f64),
 }
+
 
 impl GrapicsSystem {
     // instantiate a new graphics system
@@ -109,7 +149,7 @@ impl GrapicsSystem {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[],
+                buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -147,7 +187,7 @@ impl GrapicsSystem {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[],
+                buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -181,7 +221,18 @@ impl GrapicsSystem {
 
         let use_alt = false;
 
+        let vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(VERTICES),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
+        let vertex_count = VERTICES.len() as u32;
+
         Self {
+            window,
             surface,
             device,
             queue,
@@ -190,7 +241,8 @@ impl GrapicsSystem {
             render_pipeline,
             alternative_render_pipeline: alternate_render_pipeline,
             use_alternate_pipeline: use_alt,
-            window,
+            vertex_buffer,
+            num_vertices: vertex_count,
             background_color: (0.1, 0.2, 0.3, 1.0),
         }
     }
@@ -266,7 +318,8 @@ impl GrapicsSystem {
             } else {
                 &self.render_pipeline
             });
-            render_pass.draw(0..3, 0..1);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.draw(0..self.num_vertices, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
