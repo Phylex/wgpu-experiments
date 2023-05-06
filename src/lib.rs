@@ -8,18 +8,22 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-struct State {
+// structure to hold the state of the graphics system
+struct GrapicsSystem {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    alternative_render_pipeline: wgpu::RenderPipeline,
+    use_alternate_pipeline: bool,
     window: Window,
     background_color: (f64, f64, f64, f64),
 }
 
-impl State {
+impl GrapicsSystem {
+    // instantiate a new graphics system
     async fn new(window: Window) -> Self {
         let size = window.inner_size();
 
@@ -32,6 +36,9 @@ impl State {
         // the state owns the window and the surface should live as
         // long as the window so this should be safe
         let surface = unsafe { instance.create_surface(&window) }.unwrap();
+
+        // the adapter is the software on the cpu side that takes care of
+        // dispatching stuff to the gpu
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -41,13 +48,18 @@ impl State {
             .await
             .unwrap();
 
+        // the adapter then produces handles to the gpu and it's
+        // queues that allow the cpu to dispatch work to the gpu
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
+                    // we are not giving the gpu a name
                     label: None,
+                    // we don't require any special features
                     features: Features::empty(),
 
                     // if running on the web we need to disable some features
+                    // the 'if cfg!' thing seems to be a compile time macro
                     limits: if cfg!(target_arch = "wasm32") {
                         wgpu::Limits::downlevel_webgl2_defaults()
                     } else {
@@ -59,9 +71,12 @@ impl State {
             .await
             .unwrap();
 
+        // we can now find out what the capabilities are that the 'surface'
+        // can provide. The surface is the thing we render to
         let surface_capabilities = surface.get_capabilities(&adapter);
         let surface_format = surface_capabilities.formats.iter()
             .copied()
+            // we want an srgb capable surface
             .filter(|f| f.describe().srgb)
             .next()
             .unwrap_or(surface_capabilities.formats[0]);
@@ -126,14 +141,56 @@ impl State {
             multiview: None,
         });
 
+        let alternate_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "alt_fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        let use_alt = false;
+
         Self {
-            window,
             surface,
             device,
             queue,
             config,
             size,
             render_pipeline,
+            alternative_render_pipeline: alternate_render_pipeline,
+            use_alternate_pipeline: use_alt,
+            window,
             background_color: (0.1, 0.2, 0.3, 1.0),
         }
     }
@@ -153,7 +210,21 @@ impl State {
 
     #[allow(unused_variables)]
     fn input(&mut self, event: &WindowEvent) -> bool {
-        false
+        match event {
+            WindowEvent::KeyboardInput {
+                input: 
+                    KeyboardInput {
+                        state, 
+                        virtual_keycode: Some(VirtualKeyCode::Space),
+                        ..
+                    },
+                ..
+            } => {
+                    self.use_alternate_pipeline = *state == ElementState::Released;
+                    true
+            },
+            _ => false,
+        }
     }
 
     fn update(&mut self) {
@@ -190,7 +261,11 @@ impl State {
                 depth_stencil_attachment: None, 
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(if self.use_alternate_pipeline {
+                &self.alternative_render_pipeline
+            } else {
+                &self.render_pipeline
+            });
             render_pass.draw(0..3, 0..1);
         }
 
@@ -225,7 +300,7 @@ pub async fn run() {
             .expect("Could not append canvas to document body");
     }
 
-    let mut state = State::new(window).await;
+    let mut state = GrapicsSystem::new(window).await;
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
