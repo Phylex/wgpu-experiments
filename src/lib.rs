@@ -39,11 +39,26 @@ impl Vertex {
         }
     }
 }
-const VERTICES: &[Vertex] = &[
+const TRIANGLE: &[Vertex] = &[
     Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] },
     Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
     Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
 ];
+
+const PENTAGON: &[Vertex] = &[
+    Vertex { position: [-0.0868241, 0.49240386, 0.0], color: [0.5, 0.0, 0.5] }, // A
+    Vertex { position: [-0.49513406, 0.06958647, 0.0], color: [0.5, 0.0, 0.5] }, // B
+    Vertex { position: [0.44147372, 0.2347359, 0.0], color: [0.5, 0.0, 0.5] }, // E
+
+    Vertex { position: [-0.49513406, 0.06958647, 0.0], color: [0.5, 0.0, 0.5] }, // B
+    Vertex { position: [-0.21918549, -0.44939706, 0.0], color: [0.5, 0.0, 0.5] }, // C
+    Vertex { position: [0.44147372, 0.2347359, 0.0], color: [0.5, 0.0, 0.5] }, // E
+
+    Vertex { position: [-0.21918549, -0.44939706, 0.0], color: [0.5, 0.0, 0.5] }, // C
+    Vertex { position: [0.35966998, -0.3473291, 0.0], color: [0.5, 0.0, 0.5] }, // D
+    Vertex { position: [0.44147372, 0.2347359, 0.0], color: [0.5, 0.0, 0.5] }, // E
+];
+
 
 // structure to hold the state of the graphics system
 struct GrapicsSystem {
@@ -58,6 +73,8 @@ struct GrapicsSystem {
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
     use_alternate_pipeline: bool,
+    use_pentagon: bool,
+    pentagon_buffer: wgpu::Buffer,
     background_color: (f64, f64, f64, f64),
 }
 
@@ -223,13 +240,23 @@ impl GrapicsSystem {
 
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
+                label: Some("Triangle Buffer"),
+                contents: bytemuck::cast_slice(TRIANGLE),
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
 
-        let vertex_count = VERTICES.len() as u32;
+        
+        let pentagon_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Pentagon Buffer"),
+                contents: bytemuck::cast_slice(PENTAGON),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
+        let vertex_count = TRIANGLE.len() as u32;
+        let use_pentagon = false;
 
         Self {
             window,
@@ -242,7 +269,9 @@ impl GrapicsSystem {
             alternative_render_pipeline: alternate_render_pipeline,
             use_alternate_pipeline: use_alt,
             vertex_buffer,
+            pentagon_buffer,
             num_vertices: vertex_count,
+            use_pentagon,
             background_color: (0.1, 0.2, 0.3, 1.0),
         }
     }
@@ -273,7 +302,29 @@ impl GrapicsSystem {
                 ..
             } => {
                     self.use_alternate_pipeline = *state == ElementState::Released;
-                    true
+                    return true
+            },
+            WindowEvent::KeyboardInput {
+                input: 
+                    KeyboardInput {
+                        state, 
+                        virtual_keycode: Some(VirtualKeyCode::P),
+                        ..
+                    },
+                ..
+            } => {
+                    match *state {
+                        ElementState::Pressed => {
+                            self.use_pentagon = true;
+                            self.num_vertices = PENTAGON.len() as u32;
+                            true
+                        },
+                        ElementState::Released => {
+                            self.use_pentagon = false;
+                            self.num_vertices = TRIANGLE.len() as u32;
+                            true
+                        }
+                    }
             },
             _ => false,
         }
@@ -318,7 +369,11 @@ impl GrapicsSystem {
             } else {
                 &self.render_pipeline
             });
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            if self.use_pentagon {
+                render_pass.set_vertex_buffer(0, self.pentagon_buffer.slice(..));
+            } else {
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            };
             render_pass.draw(0..self.num_vertices, 0..1);
         }
 
