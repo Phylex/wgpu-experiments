@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 use wgpu::util::DeviceExt;
-use wgpu::Features;
+use wgpu::{Features, BufferUsages};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -15,6 +17,13 @@ use winit::{
 struct Vertex {
     position: [f32; 3],
     color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexturedVertex {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
 }
 
 impl Vertex {
@@ -39,8 +48,32 @@ impl Vertex {
         }
     }
 }
+
+
+impl TexturedVertex {
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<TexturedVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ]
+        }
+    }
+}
+
 const TRIANGLE: &[Vertex] = &[
-    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [0.0, 0.5, 0.0], color: [1.0, 0.0, 0.0] , },
     Vertex { position: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
     Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
 ];
@@ -59,6 +92,14 @@ const PENTAGON_INDICES: &[u16] = &[
     2, 3, 4,
 ];
 
+const TEXPENTAGON: &[TexturedVertex] = &[
+    TexturedVertex { position: [-0.0868241, 0.49240386, 0.0], tex_coords: [0.4131759, 0.99240386], }, // A
+    TexturedVertex { position: [-0.49513406, 0.06958647, 0.0], tex_coords: [0.0048659444, 0.56958647], }, // B
+    TexturedVertex { position: [-0.21918549, -0.44939706, 0.0], tex_coords: [0.28081453, 0.05060294], }, // C
+    TexturedVertex { position: [0.35966998, -0.3473291, 0.0], tex_coords: [0.85967, 0.1526709], }, // D
+    TexturedVertex { position: [0.44147372, 0.2347359, 0.0], tex_coords: [0.9414737, 0.7347359], }, // E
+];
+
 // structure to hold the state of the graphics system
 struct GrapicsSystem {
     window: Window,
@@ -69,13 +110,17 @@ struct GrapicsSystem {
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     alternative_render_pipeline: wgpu::RenderPipeline,
+    texture_render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_vertices: u32,
     use_alternate_pipeline: bool,
     use_pentagon: bool,
+    use_texture_pipeline: bool,
     pentagon_buffer: wgpu::Buffer,
+    textured_pentagon_buffer: wgpu::Buffer,
     background_color: (f64, f64, f64, f64),
+    diffuse_bind_group: wgpu::BindGroup,
 }
 
 
@@ -148,10 +193,109 @@ impl GrapicsSystem {
         };
         surface.configure(&device, &config);
 
+        
+        // load the image data
+        let diffuse_bytes = include_bytes!("happy-tree.png");
+        let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
+        let diffuse_rgba = diffuse_image.to_rgba8();
+        // get image dimensions
+        use image::GenericImageView;
+        let dimensions = diffuse_image.dimensions();
+        // create texture in the gpu
+        let texture_size = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+        // generate the diffuse texture buffer in the gpu
+        let diffuse_texture = device.create_texture(
+            &wgpu::TextureDescriptor {
+                size: texture_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                label: Some("diffuse_texture"),
+                view_formats: &[],
+            }
+        );
+        // copy the data from the cpu to the GPU texture
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &diffuse_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &diffuse_rgba,
+            wgpu:: ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(4*dimensions.0),
+                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+            },
+            texture_size,
+        );
+
+        // set up the sampler and the TextureView
+        let diffuse_texture_view = diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            // what to do when we upscale (sample at higher than textl resolution)
+            mag_filter: wgpu::FilterMode::Linear,
+            // what to do when we downscale
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()}
+        );
+
+        // build the texture bind group layout
+        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false, 
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
+            label: Some("diffuse_bind_group"),
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry{binding: 0, resource: wgpu::BindingResource::TextureView(&diffuse_texture_view)},
+                wgpu::BindGroupEntry{binding: 1, resource: wgpu::BindingResource::Sampler(&diffuse_sampler) },
+            ]
+        });
+        // generate the texture pipeline layout
+        let texture_pipeline_layout = 
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Texture Pipeline Layout"),
+                bind_group_layouts: &[&texture_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        // This is shader stuff
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+
+        // this is our original render pipeline layout
         // optionally use the wgpu::include_wgsl! to simplify the above code
         let render_pipeline_layout = 
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -236,7 +380,45 @@ impl GrapicsSystem {
             multiview: None,
         });
 
-        let use_alt = false;
+        println!("creating tex pipeline");
+        let texture_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("texture pipeline"),
+            layout: Some(&texture_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "tex_vs_main",
+                buffers: &[TexturedVertex::desc()],
+            },
+            primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "tex_fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None }
+        );
+
 
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -262,8 +444,18 @@ impl GrapicsSystem {
             }
         );
 
-        let vertex_count = TRIANGLE.len() as u32;
+        let pentagon_texture_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Textured Pentagon"),
+                contents: bytemuck::cast_slice(TEXPENTAGON),
+                usage: BufferUsages::VERTEX 
+            }
+        );
+
+        let vertex_count = PENTAGON_INDICES.len() as u32;
         let use_pentagon = false;
+        let use_alt = false;
+        let use_tex = true;
 
         Self {
             window,
@@ -274,13 +466,17 @@ impl GrapicsSystem {
             size,
             render_pipeline,
             alternative_render_pipeline: alternate_render_pipeline,
+            texture_render_pipeline,
             use_alternate_pipeline: use_alt,
             vertex_buffer,
             index_buffer,
             pentagon_buffer,
+            textured_pentagon_buffer: pentagon_texture_buffer,
             num_vertices: vertex_count,
             use_pentagon,
             background_color: (0.1, 0.2, 0.3, 1.0),
+            diffuse_bind_group,
+            use_texture_pipeline: use_tex,
         }
     }
 
@@ -300,6 +496,12 @@ impl GrapicsSystem {
     #[allow(unused_variables)]
     fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
+            // change the color of the background depending on mouse position
+            WindowEvent::CursorMoved { position, .. } => {
+                self.background_color.1 = position.x / self.config.height as f64;
+                self.background_color.2 = position.y / self.config.width as f64;
+                true
+            },
             WindowEvent::KeyboardInput {
                 input: 
                     KeyboardInput {
@@ -309,8 +511,16 @@ impl GrapicsSystem {
                     },
                 ..
             } => {
-                    self.use_alternate_pipeline = *state == ElementState::Released;
-                    return true
+                match *state {
+                    ElementState::Released => {
+                        self.use_alternate_pipeline = false;
+                        true
+                    },
+                    ElementState::Pressed => {
+                        self.use_alternate_pipeline = !self.use_texture_pipeline;
+                        true
+                    }
+                }
             },
             WindowEvent::KeyboardInput {
                 input: 
@@ -321,18 +531,44 @@ impl GrapicsSystem {
                     },
                 ..
             } => {
-                    match *state {
-                        ElementState::Pressed => {
-                            self.use_pentagon = true;
-                            self.num_vertices = PENTAGON_INDICES.len() as u32;
-                            true
-                        },
-                        ElementState::Released => {
-                            self.use_pentagon = false;
-                            self.num_vertices = TRIANGLE.len() as u32;
-                            true
-                        }
+                match *state {
+                    ElementState::Pressed => {
+                        self.use_pentagon = true;
+                        self.num_vertices = PENTAGON_INDICES.len() as u32;
+                        true
+                    },
+                    ElementState::Released => {
+                        self.use_pentagon = false;
+                        self.use_texture_pipeline = false;
+                        self.num_vertices = TRIANGLE.len() as u32;
+                        true
                     }
+                }
+            },
+            WindowEvent::KeyboardInput {
+                input: 
+                    KeyboardInput {
+                        state, 
+                        virtual_keycode: Some(VirtualKeyCode::T),
+                        ..
+                    },
+                ..
+            } => {
+                match *state {
+                    ElementState::Pressed => {
+                        match self.use_pentagon {
+                            true => {
+                                self.use_texture_pipeline = !self.use_alternate_pipeline;
+                            },
+                            _ => {}, 
+                        }
+                        true
+                    },
+                    ElementState::Released => {
+                        self.use_texture_pipeline = false;
+                        true
+                    }
+                }
             },
             _ => false,
         }
@@ -372,12 +608,22 @@ impl GrapicsSystem {
                 depth_stencil_attachment: None, 
             });
 
+            // set the pipeline used for rendering
             render_pass.set_pipeline(if self.use_alternate_pipeline {
                 &self.alternative_render_pipeline
+            } else if self.use_texture_pipeline {
+                &self.texture_render_pipeline
             } else {
                 &self.render_pipeline
             });
-            if self.use_pentagon {
+            
+            // set the assets used for rendering
+            if self.use_texture_pipeline {
+                render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.textured_pentagon_buffer.slice(..));
+                render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..self.num_vertices, 0, 0..1);
+            } else if self.use_pentagon {
                 render_pass.set_vertex_buffer(0, self.pentagon_buffer.slice(..));
                 render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..self.num_vertices, 0, 0..1);
@@ -443,10 +689,6 @@ pub async fn run() {
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                         state.resize(**new_inner_size);
                     },
-                    WindowEvent::CursorMoved { position, .. } => {
-                        state.background_color.1 = position.x / state.config.height as f64;
-                        state.background_color.2 = position.y / state.config.width as f64;
-                    },
                     _ => {}
                 }
             },
@@ -469,3 +711,5 @@ pub async fn run() {
         }
     });
 }
+
+
