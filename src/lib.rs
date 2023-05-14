@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+mod texture;
 
 use wgpu::util::DeviceExt;
 use wgpu::{Features, BufferUsages};
@@ -108,17 +107,22 @@ struct GrapicsSystem {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+
     render_pipeline: wgpu::RenderPipeline,
     alternative_render_pipeline: wgpu::RenderPipeline,
     texture_render_pipeline: wgpu::RenderPipeline,
+    use_alternate_pipeline: bool,
+    use_texture_pipeline: bool,
+
+    textured_pentagon_buffer: wgpu::Buffer,
+    pentagon_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_vertices: u32,
-    use_alternate_pipeline: bool,
     use_pentagon: bool,
-    use_texture_pipeline: bool,
-    pentagon_buffer: wgpu::Buffer,
-    textured_pentagon_buffer: wgpu::Buffer,
+
+    diffuse_texture: texture::Texture,
+    
     background_color: (f64, f64, f64, f64),
     diffuse_bind_group: wgpu::BindGroup,
 }
@@ -196,60 +200,7 @@ impl GrapicsSystem {
         
         // load the image data
         let diffuse_bytes = include_bytes!("happy-tree.png");
-        let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
-        let diffuse_rgba = diffuse_image.to_rgba8();
-        // get image dimensions
-        use image::GenericImageView;
-        let dimensions = diffuse_image.dimensions();
-        // create texture in the gpu
-        let texture_size = wgpu::Extent3d {
-            width: dimensions.0,
-            height: dimensions.1,
-            depth_or_array_layers: 1,
-        };
-        // generate the diffuse texture buffer in the gpu
-        let diffuse_texture = device.create_texture(
-            &wgpu::TextureDescriptor {
-                size: texture_size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                label: Some("diffuse_texture"),
-                view_formats: &[],
-            }
-        );
-        // copy the data from the cpu to the GPU texture
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &diffuse_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &diffuse_rgba,
-            wgpu:: ImageDataLayout {
-                offset: 0,
-                bytes_per_row: std::num::NonZeroU32::new(4*dimensions.0),
-                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
-            },
-            texture_size,
-        );
-
-        // set up the sampler and the TextureView
-        let diffuse_texture_view = diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            // what to do when we upscale (sample at higher than textl resolution)
-            mag_filter: wgpu::FilterMode::Linear,
-            // what to do when we downscale
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()}
-        );
+        let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree").unwrap();
 
         // build the texture bind group layout
         let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
@@ -277,8 +228,8 @@ impl GrapicsSystem {
             label: Some("diffuse_bind_group"),
             layout: &texture_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry{binding: 0, resource: wgpu::BindingResource::TextureView(&diffuse_texture_view)},
-                wgpu::BindGroupEntry{binding: 1, resource: wgpu::BindingResource::Sampler(&diffuse_sampler) },
+                wgpu::BindGroupEntry{binding: 0, resource: wgpu::BindingResource::TextureView(&diffuse_texture.view)},
+                wgpu::BindGroupEntry{binding: 1, resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler) },
             ]
         });
         // generate the texture pipeline layout
@@ -453,7 +404,7 @@ impl GrapicsSystem {
         );
 
         let vertex_count = PENTAGON_INDICES.len() as u32;
-        let use_pentagon = false;
+        let use_pentagon = true;
         let use_alt = false;
         let use_tex = true;
 
@@ -477,6 +428,7 @@ impl GrapicsSystem {
             background_color: (0.1, 0.2, 0.3, 1.0),
             diffuse_bind_group,
             use_texture_pipeline: use_tex,
+            diffuse_texture,
         }
     }
 
@@ -711,5 +663,3 @@ pub async fn run() {
         }
     });
 }
-
-
