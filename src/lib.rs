@@ -1,9 +1,15 @@
+use std::collections::HashMap;
+use std::fmt::format;
+use std::iter::zip;
+
+use bytemuck::cast_slice;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 mod texture;
+mod observer;
 
 use wgpu::util::DeviceExt;
-use wgpu::{Features, BufferUsages};
+use wgpu::{Features, BufferUsages, RenderPass};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -99,8 +105,102 @@ const TEXPENTAGON: &[TexturedVertex] = &[
     TexturedVertex { position: [0.44147372, 0.2347359, 0.0], tex_coords: [0.9414737, 0.7347359], }, // E
 ];
 
+struct Pipelines<'a> {
+    render_groups: HashMap<String, (&'a wgpu::RenderPipeline, Vec<(&'a wgpu::Buffer, usize)>, Vec<&'a wgpu::BindGroup>)>,
+    available_pipelines: HashMap<String, wgpu::RenderPipeline>,
+    available_buffers: HashMap<String, (wgpu::Buffer, usize)>,
+    available_bind_groups: HashMap<String, wgpu::BindGroup>,
+    selected_pipeline: Option<String>,
+}
+
+impl<'a> Pipelines {
+    pub fn new() -> Self {
+        Self {
+            render_groups: HashMap::new(),
+            available_pipelines: HashMap::new(),
+            available_buffers: HashMap::new(),
+            available_bind_groups: HashMap::new(),
+            selected_pipeline: None,
+        }
+    }
+    pub fn add_pipeline(&mut self, name: &str, pipeline: wgpu::RenderPipeline) {
+        if self.available_pipelines.contains_key(name.into()) {
+            panic!("Buffer with name {} already exists", name);
+        } else {
+            self.available_pipelines.insert(name.into(), pipeline);
+        }
+    }
+
+    pub fn add_buffer(&mut self, name: &str, buf: wgpu::Buffer, elements: usize) {
+        if self.available_buffers.contains_key(name.into()) {
+            panic!("Buffer with name {} already exists", name);
+        } else {
+            self.available_buffers.insert(name.into(), (buf, elements));
+        }
+    }
+
+    pub fn add_bind_group(&mut self, name: &str, bindgroup: wgpu::BindGroup) {
+        if self.available_bind_groups.contains_key(name.into()) {
+            panic!("BindGroup with name {} already exists", name);
+        } else {
+            self.available_bind_groups.insert(name.into(), bindgroup);
+        }
+    }
+
+    pub fn init_render_group(&mut self, name: &str, pl_name: &str) {
+        let pipeline = self.available_pipelines.get(pl_name).expect(&format!("Buffer with name {} not found", pl_name));
+        if self.render_groups.contains_key(name.into()) {
+            panic!("Render group with name {} already exists", name);
+        } else {
+            self.render_groups.insert(name.into(), (pipeline, Vec::new(), Vec::new()));
+        }
+    }
+
+    /// Link together the buffer with the pipeline that needs it
+    /// Panic if either the buffer or the pipeline can not be found
+    pub fn link_buffer(&mut self, buf_name: &str, rg_name: &str) {
+        let (buffer, bsize) = self.available_buffers.get(buf_name).expect(&format!("Buffer with name {} not found", buf_name));
+        let (pipeline, mut buffers, bind_groups) = self.render_groups.get(rg_name).expect(&format!("Render Group with name {} not found", rg_name));
+        buffers.push((&buffer, *bsize));
+    }
+    
+    pub fn link_bind_group(&mut self, bg_name: &str, rg_name: &str) {
+        let bind_group = self.available_bind_groups.get(bg_name).expect(&format!("Buffer with name {} not found", bg_name));
+        let (_, _, mut bind_groups) = self.render_groups.get(rg_name).expect(&format!("Render Group with name {} not found", rg_name));
+        bind_groups.push(bind_group);
+    }
+
+    pub fn set_up(&self, rg_name: &str, render_pass: &mut wgpu::RenderPass) -> usize {
+        let (pipeline, buffers, bind_groups) = self.render_groups.get(rg_name).expect(&format!("Render Group with name {} dose not exists", rg_name));
+        render_pass.set_pipeline(pipeline);
+        let mut buffer_slot: u32 = 0;
+        let mut bind_group_slot: u32 = 0;
+        let mut index_count: usize = 0;
+        let mut vertex_count: usize = 0;
+        for (buffer, size) in buffers {
+            match buffer.usage() {
+               BufferUsages::INDEX => {
+                   render_pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint16);
+                   index_count = *size;
+               }, 
+               BufferUsages::VERTEX => {
+                   render_pass.set_vertex_buffer(buffer_slot, buffer.slice(..));
+                   vertex_count = * size;
+                   buffer_slot += 1;
+               }, 
+               _ => ()
+           }
+        };
+        for &bind_group in bind_groups {
+            render_pass.set_bind_group(bind_group_slot, bind_group, &[]);
+            bind_group_slot += 1;
+        };
+        if index_count > 0 { index_count } else { vertex_count }
+    }
+}
+
 // structure to hold the state of the graphics system
-struct GrapicsSystem {
+struct GrapicsSystem<'a> {
     window: Window,
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -108,27 +208,18 @@ struct GrapicsSystem {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
 
-    render_pipeline: wgpu::RenderPipeline,
-    alternative_render_pipeline: wgpu::RenderPipeline,
-    texture_render_pipeline: wgpu::RenderPipeline,
-    use_alternate_pipeline: bool,
-    use_texture_pipeline: bool,
-
-    textured_pentagon_buffer: wgpu::Buffer,
-    pentagon_buffer: wgpu::Buffer,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_vertices: u32,
-    use_pentagon: bool,
+    pipelines: Pipelines<'a>,
 
     diffuse_texture: texture::Texture,
     
     background_color: (f64, f64, f64, f64),
-    diffuse_bind_group: wgpu::BindGroup,
+
+    observer: observer::Observer,
+    observer_uniform: observer::ObserverUniform,
 }
 
 
-impl GrapicsSystem {
+impl<'a> GrapicsSystem {
     // instantiate a new graphics system
     async fn new(window: Window) -> Self {
         let size = window.inner_size();
@@ -197,8 +288,16 @@ impl GrapicsSystem {
         };
         surface.configure(&device, &config);
 
+        // Struct that holds the pipelines and buffers and allows switching between them
+        let mut pipelines = Pipelines::new();
+
+        // This is shader stuff
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
         
-        // load the image data
+        // load the texture
         let diffuse_bytes = include_bytes!("happy-tree.png");
         let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree").unwrap();
 
@@ -232,6 +331,7 @@ impl GrapicsSystem {
                 wgpu::BindGroupEntry{binding: 1, resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler) },
             ]
         });
+        pipelines.add_bind_group("diffuse_bind_group", diffuse_bind_group);
         // generate the texture pipeline layout
         let texture_pipeline_layout = 
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -239,12 +339,47 @@ impl GrapicsSystem {
                 bind_group_layouts: &[&texture_bind_group_layout],
                 push_constant_ranges: &[],
             });
-
-        // This is shader stuff
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
+        // generate the render pipeline for the 
+        let texture_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("texture pipeline"),
+            layout: Some(&texture_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "tex_vs_main",
+                buffers: &[TexturedVertex::desc()],
+            },
+            primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "tex_fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent::REPLACE,
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None }
+        );
+        pipelines.add_pipeline("texture", texture_render_pipeline);
+        pipelines.init_render_group("texture", "texture");
+        pipelines.link_bind_group("diffuse_bind_group", "texture");
 
         // this is our original render pipeline layout
         // optionally use the wgpu::include_wgsl! to simplify the above code
@@ -292,6 +427,8 @@ impl GrapicsSystem {
             },
             multiview: None,
         });
+        pipelines.add_pipeline("default", render_pipeline);
+        pipelines.init_render_group("default", "default");
 
         let alternate_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
@@ -330,14 +467,118 @@ impl GrapicsSystem {
             },
             multiview: None,
         });
+        pipelines.add_pipeline("alternate", alternate_render_pipeline);
+        pipelines.init_render_group("alternate", "alternate");
 
-        println!("creating tex pipeline");
-        let texture_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("texture pipeline"),
-            layout: Some(&texture_pipeline_layout),
+        let vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Triangle Buffer"),
+                contents: bytemuck::cast_slice(TRIANGLE),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        pipelines.add_buffer("simple_triangle", vertex_buffer, TRIANGLE.len());
+        pipelines.link_buffer("simple_triangle", "default");
+        pipelines.link_buffer("simple_triangle", "alternate");
+
+        let index_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("pentagon index_buffer"),
+                contents: bytemuck::cast_slice(PENTAGON_INDICES),
+                usage: wgpu::BufferUsages::INDEX,
+            }
+        );
+        pipelines.add_buffer("pentagon_index", index_buffer, PENTAGON_INDICES.len());
+        pipelines.init_render_group("default-pentagon", "default");
+        pipelines.init_render_group("alternate-pentagon", "alternate");
+        pipelines.link_buffer("pentagon_index", "default-pentagon");
+        pipelines.link_buffer("pentagon_index", "alternate-pentagon");
+        pipelines.link_buffer("pentagon_index", "texture");
+        
+        let pentagon_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Pentagon Buffer"),
+                contents: bytemuck::cast_slice(PENTAGON),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        pipelines.add_buffer("pentagon_vertex", pentagon_buffer, PENTAGON.len());
+        pipelines.link_buffer("pentagon_vertex", "default-pentagon");
+        pipelines.link_buffer("pentagon_vertex", "alternate-pentagon");
+
+        let pentagon_texture_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Textured Pentagon"),
+                contents: bytemuck::cast_slice(TEXPENTAGON),
+                usage: BufferUsages::VERTEX 
+            }
+        );
+        pipelines.add_buffer("texture-pentagon", pentagon_texture_buffer, TEXPENTAGON.len());
+        pipelines.link_buffer("texture-pentagon", "texture");
+
+        let observer = observer::Observer {
+            location: (0.0, 1.0, 2.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: config.width as f32 / config.height as f32,
+            field_of_view: 45.0,
+            znear: 0.1,
+            zfar: 100.0
+        };
+
+        // This is the location where the transformation
+        // matrix that is computed by the CPU is stored in
+        // the gpu to be included in the vertex shader
+        let mut observer_uniform = observer::ObserverUniform::new();
+        observer_uniform.update_projection(&observer);
+        let observer_projection_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Observer projection buffer"),
+                contents: cast_slice(&[observer_uniform]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let observer_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            ],
+            label: Some("Observer bind group layout"),
+        });
+        let observer_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
+            label: Some("observer bind group"),
+            layout: &observer_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: observer_projection_buffer.as_entire_binding(),
+                }
+            ],
+        });
+        pipelines.add_bind_group("3d_observer", observer_bind_group);
+        let render_pipeline_layout_3d = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("3D Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    &texture_bind_group_layout,
+                    &observer_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            }
+        );
+        let render_pipeline_3d = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("3d render pipeline"),
+            layout: Some(&render_pipeline_layout_3d),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "tex_vs_main",
+                entry_point: "vs_3d_main",
                 buffers: &[TexturedVertex::desc()],
             },
             primitive: wgpu::PrimitiveState {
@@ -369,66 +610,26 @@ impl GrapicsSystem {
             }),
             multiview: None }
         );
-
-
-        let vertex_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Triangle Buffer"),
-                contents: bytemuck::cast_slice(TRIANGLE),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-
-        let index_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Triangle_index_buffer"),
-                contents: bytemuck::cast_slice(PENTAGON_INDICES),
-                usage: wgpu::BufferUsages::INDEX,
-            }
-        );
-        
-        let pentagon_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Pentagon Buffer"),
-                contents: bytemuck::cast_slice(PENTAGON),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-
-        let pentagon_texture_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Textured Pentagon"),
-                contents: bytemuck::cast_slice(TEXPENTAGON),
-                usage: BufferUsages::VERTEX 
-            }
-        );
-
-        let vertex_count = PENTAGON_INDICES.len() as u32;
-        let use_pentagon = true;
-        let use_alt = false;
-        let use_tex = true;
+        pipelines.add_pipeline("3d", render_pipeline_3d);
+        pipelines.init_render_group("3d", "3d");
+        pipelines.link_bind_group("diffuse_bind_group", "3d");
+        pipelines.link_bind_group("3d_observer", "3d");
+        pipelines.link_buffer("pentagon_index", "3d");
+        pipelines.link_buffer("pentagon_vertex", "3d");
+        pipelines.add_buffer("observer-projection", observer_projection_buffer, 0);
 
         Self {
+            pipelines,
             window,
             surface,
             device,
             queue,
             config,
             size,
-            render_pipeline,
-            alternative_render_pipeline: alternate_render_pipeline,
-            texture_render_pipeline,
-            use_alternate_pipeline: use_alt,
-            vertex_buffer,
-            index_buffer,
-            pentagon_buffer,
-            textured_pentagon_buffer: pentagon_texture_buffer,
-            num_vertices: vertex_count,
-            use_pentagon,
             background_color: (0.1, 0.2, 0.3, 1.0),
-            diffuse_bind_group,
-            use_texture_pipeline: use_tex,
             diffuse_texture,
+            observer,
+            observer_uniform,
         }
     }
 
@@ -442,6 +643,8 @@ impl GrapicsSystem {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.observer.aspect = new_size.width as f32 / new_size.height as f32;
+            self.observer_uniform.update_projection(&self.observer)
         };
     }
 
