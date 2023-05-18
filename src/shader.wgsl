@@ -1,59 +1,25 @@
 // Vertex shader
-
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) color: vec3<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>
-};
-
-struct TexVerInput {
-    @location(0) position: vec3<f32>,
-    @location(1) tex_coords: vec2<f32>,
-};
-
-struct TexVerOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-};
-
-
-@vertex
-fn vs_main(model: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.color = model.color;
-    out.clip_position = vec4<f32>(model.position, 1.0);
-    return out;
-}
-
-
-@vertex
-fn tex_vs_main(
-    model: TexVerInput,
-) -> TexVerOutput {
-    var out: TexVerOutput;
-    out.tex_coords = model.tex_coords;
-    out.clip_position = vec4<f32>(model.position, 1.0);
-    return out;
-}
-
-// uniform that holds the view-projection matrix for the universe
 struct ObserverUniform {
     view_proj: mat4x4<f32>,
 };
-// bind that uniform to the vertex shader telling the shader compiler
-// that the observerUniform needs to be available inside the vertex
-// shader
-@gropu(1)@binding(0)
+@group(1) @binding(0)
 var<uniform> observer: ObserverUniform;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) tex_coords: vec2<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+}
+
 @vertex
-fn vs_3d_main(
-    model: TexVerInput,
-) -> TexVerOutput {
-    var out: TexVerOutput;
+fn vs_main(
+    model: VertexInput,
+) -> VertexOutput {
+    var out: VertexOutput;
     out.tex_coords = model.tex_coords;
     out.clip_position = observer.view_proj * vec4<f32>(model.position, 1.0);
     return out;
@@ -61,21 +27,12 @@ fn vs_3d_main(
 
 // Fragment shader
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
-}
-
-@fragment
-fn alt_fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.clip_position);
-}
-
 @group(0) @binding(0)
 var t_diffuse: texture_2d<f32>;
-@group(0) @binding(1)
+@group(0)@binding(1)
 var s_diffuse: sampler;
+
 @fragment
-fn tex_fs_main(in: TexVerOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(t_diffuse, s_diffuse, in.tex_coords);
 }
