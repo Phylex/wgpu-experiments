@@ -2,7 +2,7 @@ use std::iter;
 use instant::Instant;
 use log::{warn, debug, error, log_enabled, info, Level};
 
-use observer::{ObserverUniform, ObserverControlls, Observer, Projection};
+use observer::{ObserverControlls, Observer, Projection, ObserverViewMatrix};
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -85,11 +85,9 @@ struct State {
     diffuse_bind_group: wgpu::BindGroup,
     window: Window,
     observer: observer::Observer, 
-    observer_uniform: ObserverUniform,
-    observer_transform_buffer: wgpu::Buffer,
-    observer_bind_group: wgpu::BindGroup,
     observer_controlls: ObserverControlls,
     observer_projection: Projection,
+    observer_uniform: observer::ObserverUniform,
     mouse_pressed: bool,
 }
 
@@ -188,39 +186,8 @@ impl State {
         let observer = Observer::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection = Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
         let observer_controlls = ObserverControlls::new(4.0, 0.4);
-
-        let mut observer_projection_uniform = ObserverUniform::new();
-        observer_projection_uniform.update_projection(&observer, &projection);
-
-        let observer_projection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ObserverBuffer"),
-            contents: bytemuck::cast_slice(&[observer_projection_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let observer_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera_bind_group_layout"),
-            });
-
-        let observer_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &observer_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: observer_projection_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
-        });
+        let mut observer_uniform = observer::ObserverUniform::new(&device);
+        observer_uniform.update(&observer, &projection, &queue);
 
         let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -247,7 +214,7 @@ impl State {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[
                     &texture_bind_group_layout,
-                    &observer_bind_group_layout,
+                    &observer_uniform.bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -322,9 +289,7 @@ impl State {
             diffuse_bind_group,
             window,
             observer,
-            observer_bind_group,
-            observer_transform_buffer: observer_projection_buffer,
-            observer_uniform: observer_projection_uniform,
+            observer_uniform,
             observer_controlls,
             observer_projection: projection,
             mouse_pressed: false,
@@ -366,8 +331,7 @@ impl State {
 
     fn update(&mut self, dt: instant::Duration) {
         self.observer_controlls.update_observer(&mut self.observer, dt);
-        self.observer_uniform.update_projection(&self.observer, &self.observer_projection);
-        self.queue.write_buffer(&self.observer_transform_buffer, 0, bytemuck::cast_slice(&[self.observer_uniform]));
+        self.observer_uniform.update(&self.observer, &self.observer_projection, &self.queue);
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -403,7 +367,7 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.observer_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.observer_uniform.bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
