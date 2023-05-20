@@ -214,19 +214,19 @@ impl ObserverControlls {
     pub fn process_keyboard_input(&mut self, key: VirtualKeyCode, state: ElementState) -> bool {
         let amount: f32 = if state == ElementState::Pressed {1.0} else {0.0};
         match key {
-            VirtualKeyCode::W | VirtualKeyCode::Up => {
+            VirtualKeyCode::R | VirtualKeyCode::Up => {
                 self.amount_forward = amount;
                 true
             }
-            VirtualKeyCode::S | VirtualKeyCode::Down => {
+            VirtualKeyCode::H | VirtualKeyCode::Down => {
                 self.amount_backward = amount;
                 true
             }
-            VirtualKeyCode::A | VirtualKeyCode::Left => {
+            VirtualKeyCode::S | VirtualKeyCode::Left => {
                 self.amount_left = amount;
                 true
             }
-            VirtualKeyCode::D | VirtualKeyCode::Right => {
+            VirtualKeyCode::T | VirtualKeyCode::Right => {
                 self.amount_right = amount;
                 true
             }

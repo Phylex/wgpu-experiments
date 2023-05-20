@@ -1,8 +1,7 @@
 use std::iter;
 use instant::Instant;
-use log::{warn, debug, error, log_enabled, info, Level};
-
-use observer::{ObserverControlls, Observer, Projection, ObserverViewMatrix};
+use cgmath::*;
+use observer::{ObserverControlls, Observer, Projection};
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -70,6 +69,69 @@ const VERTICES: &[Vertex] = &[
 
 const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, /* padding */ 0];
 
+const NUM_INSTANCES_PER_ROW: u32 = 10;
+const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 0.5, 0.0, NUM_INSTANCES_PER_ROW as f32 * 0.5);
+
+struct Instance {
+    position: cgmath::Vector3<f32>,
+    rotation: cgmath::Quaternion<f32>,
+}
+
+impl Instance {
+    fn to_raw(&self) -> RawInstance {
+        RawInstance{
+            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RawInstance {
+    model: [[f32; 4]; 4],
+}
+
+impl RawInstance {
+    /// Generate the layout for the Vertex Buffer used to store the instance transformation matrix
+    /// on the gpu
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<RawInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
+                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+                // for each vec4. We'll have to reassemble the mat4 in
+                // the shader.
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
+
+
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -89,6 +151,9 @@ struct State {
     observer_projection: Projection,
     observer_uniform: observer::ObserverUniform,
     mouse_pressed: bool,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+    instance_rot_speed: f32,
 }
 
 impl State {
@@ -225,7 +290,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), RawInstance::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -274,6 +339,35 @@ impl State {
             usage: wgpu::BufferUsages::INDEX,
         });
         let num_indices = INDICES.len() as u32;
+        
+        // this is effectively a somewhat fancy way of generating a list of instances
+        // using generators and iterator mechanics
+        let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
+            (0..NUM_INSTANCES_PER_ROW).map(move |x| {
+                let position = cgmath::Vector3 { x: x as f32, y: 0.0, z: z as f32 } - INSTANCE_DISPLACEMENT;
+
+                let rotation = if position.is_zero() {
+                    // this is needed so an object at (0, 0, 0) won't get scaled to zero
+                    // as Quaternions can effect scale if they're not created correctly
+                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                } else {
+                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+                };
+
+                Instance {
+                    position, rotation,
+                }
+            })
+        }).collect::<Vec<_>>();
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&instance_data),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+
 
         Self {
             surface,
@@ -293,6 +387,9 @@ impl State {
             observer_controlls,
             observer_projection: projection,
             mouse_pressed: false,
+            instances,
+            instance_buffer,
+            instance_rot_speed: 1.,
         }
     }
 
@@ -332,7 +429,20 @@ impl State {
     fn update(&mut self, dt: instant::Duration) {
         self.observer_controlls.update_observer(&mut self.observer, dt);
         self.observer_uniform.update(&self.observer, &self.observer_projection, &self.queue);
+
+        // update the instances to rotate
+        self.instances = self.instances.iter().map(|i| {
+            let new_rot = i.rotation * cgmath::Quaternion::from_axis_angle(i.position.normalize(), cgmath::Deg(10.0 * dt.as_secs_f32() * self.instance_rot_speed));
+            Instance {
+                position: i.position,
+                rotation: new_rot,
+            }
+        }).collect::<Vec<_>>();
+        let instance_data = self.instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        // write the rotations to the buffer
+        self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
     }
+
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
@@ -369,8 +479,9 @@ impl State {
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_bind_group(1, &self.observer_uniform.bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0 .. self.instances.len() as _);
         }
 
         self.queue.submit(iter::once(encoder.finish()));

@@ -8,20 +8,34 @@ var<uniform> observer: ObserverUniform;
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) tex_coords: vec2<f32>,
-}
+};
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
-}
+};
+
+struct InstanceInput {
+    @location(5) transform_matrix_0: vec4<f32>,
+    @location(6) transform_matrix_1: vec4<f32>,
+    @location(7) transform_matrix_2: vec4<f32>,
+    @location(8) transform_matrix_3: vec4<f32>,
+};
 
 @vertex
 fn vs_main(
     model: VertexInput,
+    instance: InstanceInput,
 ) -> VertexOutput {
+    let instance_transform = mat4x4<f32>(
+        instance.transform_matrix_0,
+        instance.transform_matrix_1,
+        instance.transform_matrix_2,
+        instance.transform_matrix_3,
+    );
     var out: VertexOutput;
     out.tex_coords = model.tex_coords;
-    out.clip_position = observer.view_proj * vec4<f32>(model.position, 1.0);
+    out.clip_position = observer.view_proj * instance_transform * vec4<f32>(model.position, 1.0);
     return out;
 }
 
