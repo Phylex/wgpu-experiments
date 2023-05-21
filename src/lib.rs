@@ -8,25 +8,28 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use model::Vertex;
 
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod resources;
+mod model;
 mod texture;
 mod observer;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
+struct BasicVertex {
     position: [f32; 3],
     tex_coords: [f32; 2],
 }
 
-impl Vertex {
+impl BasicVertex {
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         use std::mem;
         wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            array_stride: mem::size_of::<BasicVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -44,24 +47,24 @@ impl Vertex {
     }
 }
 
-const VERTICES: &[Vertex] = &[
-    Vertex {
+const VERTICES: &[BasicVertex] = &[
+    BasicVertex {
         position: [-0.0868241, 0.49240386, 0.0],
         tex_coords: [0.4131759, 0.00759614],
     }, // A
-    Vertex {
+    BasicVertex {
         position: [-0.49513406, 0.06958647, 0.0],
         tex_coords: [0.0048659444, 0.43041354],
     }, // B
-    Vertex {
+    BasicVertex {
         position: [-0.21918549, -0.44939706, 0.0],
         tex_coords: [0.28081453, 0.949397],
     }, // C
-    Vertex {
+    BasicVertex {
         position: [0.35966998, -0.3473291, 0.0],
         tex_coords: [0.85967, 0.84732914],
     }, // D
-    Vertex {
+    BasicVertex {
         position: [0.44147372, 0.2347359, 0.0],
         tex_coords: [0.9414737, 0.2652641],
     }, // E
@@ -70,7 +73,9 @@ const VERTICES: &[Vertex] = &[
 const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, /* padding */ 0];
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
-const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 0.5, 0.0, NUM_INSTANCES_PER_ROW as f32 * 0.5);
+const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new( NUM_INSTANCES_PER_ROW as
+    f32 * 0.5,
+    0.0, NUM_INSTANCES_PER_ROW as f32 * 0.5);
 
 struct Instance {
     position: cgmath::Vector3<f32>,
@@ -139,9 +144,6 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
     #[allow(dead_code)]
     diffuse_texture: texture::Texture,
     diffuse_bind_group: wgpu::BindGroup,
@@ -154,6 +156,8 @@ struct State {
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     instance_rot_speed: f32,
+    obj_model: model::Model,
+    depth_texture: texture::Texture,
 }
 
 impl State {
@@ -273,6 +277,8 @@ impl State {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+        
+        let depth_texture = texture::Texture::create_depth_texture(&device, &config, "depth texture");
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -290,7 +296,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc(), RawInstance::desc()],
+                buffers: &[model::ModelVertex::desc(), RawInstance::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -317,7 +323,13 @@ impl State {
                 // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: texture::Texture::DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -328,23 +340,19 @@ impl State {
             multiview: None,
         });
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let num_indices = INDICES.len() as u32;
+        // here we load the model and that we are going to render in this case it is a cube
+        let obj_model = resources::load_model("cube.obj", &device, &queue, &texture_bind_group_layout)
+            .await
+            .unwrap();
         
         // this is effectively a somewhat fancy way of generating a list of instances
         // using generators and iterator mechanics
+        const SPACE_BETWEEN: f32 = 3.0;
         let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
             (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                let position = cgmath::Vector3 { x: x as f32, y: 0.0, z: z as f32 } - INSTANCE_DISPLACEMENT;
+                let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let position = cgmath::Vector3 { x, y: 0.0, z };
 
                 let rotation = if position.is_zero() {
                     // this is needed so an object at (0, 0, 0) won't get scaled to zero
@@ -370,15 +378,14 @@ impl State {
 
 
         Self {
+            depth_texture,
             surface,
             device,
             queue,
             config,
             size,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
+            obj_model,
             diffuse_texture,
             diffuse_bind_group,
             window,
@@ -404,6 +411,7 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.observer_projection.resize(new_size.width, new_size.height);
+            self.depth_texture = texture::Texture::create_depth_texture(&self.device, &self.config, "depth texture")
         }
     }
 
@@ -432,7 +440,7 @@ impl State {
 
         // update the instances to rotate
         self.instances = self.instances.iter().map(|i| {
-            let new_rot = i.rotation * cgmath::Quaternion::from_axis_angle(i.position.normalize(), cgmath::Deg(10.0 * dt.as_secs_f32() * self.instance_rot_speed));
+            let new_rot = i.rotation * cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(10.0 * dt.as_secs_f32() * self.instance_rot_speed));
             Instance {
                 position: i.position,
                 rotation: new_rot,
@@ -472,16 +480,21 @@ impl State {
                         store: true,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { 
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations { 
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: true }),
+                        stencil_ops: None,
+                }),
             });
 
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_bind_group(1, &self.observer_uniform.bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0 .. self.instances.len() as _);
+            use model::DrawModel;
+            render_pass.draw_mesh_instanced(&self.obj_model.meshes[0], 0..self.instances.len() as u32);
         }
 
         self.queue.submit(iter::once(encoder.finish()));
