@@ -9,6 +9,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 use model::Vertex;
+use model::DrawModel;
 
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
@@ -17,60 +18,6 @@ mod resources;
 mod model;
 mod texture;
 mod observer;
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct BasicVertex {
-    position: [f32; 3],
-    tex_coords: [f32; 2],
-}
-
-impl BasicVertex {
-    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<BasicVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-            ],
-        }
-    }
-}
-
-const VERTICES: &[BasicVertex] = &[
-    BasicVertex {
-        position: [-0.0868241, 0.49240386, 0.0],
-        tex_coords: [0.4131759, 0.00759614],
-    }, // A
-    BasicVertex {
-        position: [-0.49513406, 0.06958647, 0.0],
-        tex_coords: [0.0048659444, 0.43041354],
-    }, // B
-    BasicVertex {
-        position: [-0.21918549, -0.44939706, 0.0],
-        tex_coords: [0.28081453, 0.949397],
-    }, // C
-    BasicVertex {
-        position: [0.35966998, -0.3473291, 0.0],
-        tex_coords: [0.85967, 0.84732914],
-    }, // D
-    BasicVertex {
-        position: [0.44147372, 0.2347359, 0.0],
-        tex_coords: [0.9414737, 0.2652641],
-    }, // E
-];
-
-const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, /* padding */ 0];
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
 const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new( NUM_INSTANCES_PER_ROW as
@@ -145,8 +92,6 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
-    diffuse_texture: texture::Texture,
-    diffuse_bind_group: wgpu::BindGroup,
     window: Window,
     observer: observer::Observer, 
     observer_controlls: ObserverControlls,
@@ -223,10 +168,6 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let diffuse_bytes = include_bytes!("happy-tree.png");
-        let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
-
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -258,20 +199,6 @@ impl State {
         let mut observer_uniform = observer::ObserverUniform::new(&device);
         observer_uniform.update(&observer, &projection, &queue);
 
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
-                },
-            ],
-            label: Some("diffuse_bind_group"),
-        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
@@ -386,8 +313,6 @@ impl State {
             size,
             render_pipeline,
             obj_model,
-            diffuse_texture,
-            diffuse_bind_group,
             window,
             observer,
             observer_uniform,
@@ -491,10 +416,7 @@ impl State {
 
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.observer_uniform.bind_group, &[]);
-            use model::DrawModel;
-            render_pass.draw_mesh_instanced(&self.obj_model.meshes[0], 0..self.instances.len() as u32);
+            render_pass.draw_model_instanced(&self.obj_model, 0..self.instances.len() as u32, &self.observer_uniform.bind_group);
         }
 
         self.queue.submit(iter::once(encoder.finish()));
