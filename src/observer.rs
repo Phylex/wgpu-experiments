@@ -177,7 +177,6 @@ fn create_gpu_buffer(device: &wgpu::Device, projection: ObserverViewMatrix) -> w
     })
 }
 
-
 /// The ObserverControlls are the user interface to an observer it allows the user to
 /// move the observer around and look at different objects in the scene/world
 #[derive(Debug)]
@@ -262,7 +261,8 @@ impl ObserverControlls {
 
         // Process moving forward/backward/left/right/up/down
         let (yaw_sin, yaw_cos) = observer.yaw.0.sin_cos();
-        let forward = Vector3::new(yaw_cos, 0.0, yaw_sin).normalize();
+        let pitch_sin = observer.pitch.0.sin();
+        let forward = Vector3::new(yaw_cos, pitch_sin, yaw_sin).normalize();
         let right = Vector3::new(-yaw_sin, 0.0, yaw_cos).normalize();
         observer.position += forward * (self.amount_forward - self.amount_backward) * self.speed * dt;
         observer.position += right * (self.amount_right - self.amount_left) * self.speed * dt;
