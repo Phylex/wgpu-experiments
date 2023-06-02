@@ -145,7 +145,7 @@ fn create_gpu_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout 
         label: Some("observer bind group layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,

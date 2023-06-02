@@ -21,9 +21,6 @@ mod observer;
 mod light;
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
-const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new( NUM_INSTANCES_PER_ROW as
-    f32 * 0.5,
-    0.0, NUM_INSTANCES_PER_ROW as f32 * 0.5);
 
 struct Instance {
     position: cgmath::Vector3<f32>,
@@ -34,6 +31,7 @@ impl Instance {
     fn to_raw(&self) -> RawInstance {
         RawInstance{
             model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
+            scale: [1.0, 1.0, 1.0, 1.0],
         }
     }
 }
@@ -42,6 +40,7 @@ impl Instance {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct RawInstance {
     model: [[f32; 4]; 4],
+    scale: [f32; 4],
 }
 
 impl RawInstance {
@@ -76,6 +75,11 @@ impl RawInstance {
                 wgpu::VertexAttribute {
                     offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
                     shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
+                    shader_location: 9,
                     format: wgpu::VertexFormat::Float32x4,
                 },
             ],
@@ -446,9 +450,9 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 0.001,
+                            g: 0.001,
+                            b: 0.001,
                             a: 1.0,
                         }),
                         store: true,

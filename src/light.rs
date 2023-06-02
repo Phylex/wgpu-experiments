@@ -74,6 +74,8 @@ impl Light {
             },
             None => {}
         };
-        dev_queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[self.uniform]));
+        if write_buffer {
+            dev_queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[self.uniform]));
+        }
     }
 }
