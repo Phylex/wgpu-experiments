@@ -8,11 +8,29 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use egui_wgpu_backend;
+use egui_winit_platform::{Platform, PlatformDescriptor};
 use model::Vertex;
 use model::DrawModel;
+use egui::FontDefinitions;
 
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
+
+/// A custom event type for the winit app.
+enum REvent {
+    RequestRedraw,
+}
+
+/// This is the repaint signal type that egui needs for requesting a repaint from another thread.
+/// It sends the custom RequestRedraw event to the winit event loop.
+struct ExampleRepaintSignal(std::sync::Mutex<winit::event_loop::EventLoopProxy<REvent>>);
+
+impl epi::backend::RepaintSignal for ExampleRepaintSignal {
+    fn request_repaint(&self) {
+        self.0.lock().unwrap().send_event(REvent::RequestRedraw).ok();
+    }
+}
 
 mod resources;
 mod model;
@@ -165,6 +183,9 @@ struct State {
     obj_model: model::Model,
     depth_texture: texture::Texture,
     light: light::Light,
+    ui_platform: Platform,
+    ui_render_pass: egui_wgpu_backend::RenderPass,
+    start_time: Instant,
 }
 
 impl State {
@@ -192,6 +213,7 @@ impl State {
             })
             .await
             .unwrap();
+
         let (mut device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -216,7 +238,7 @@ impl State {
         // Srgb surfaces, you'll need to account for that when drawing to the frame.
         let surface_format = surface_caps.formats.iter()
             .copied()
-            .filter(|f| f.describe().srgb)
+            .filter(|f| f.is_srgb())
             .next()
             .unwrap_or(surface_caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
@@ -229,6 +251,16 @@ impl State {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+
+        // initialize the egui platform
+         let platform = Platform::new(PlatformDescriptor {
+            physical_width: size.width as u32,
+            physical_height: size.height as u32,
+            scale_factor: window.scale_factor(),
+            font_definitions: FontDefinitions::default(),
+            style: Default::default(),
+        });
+        let egui_render_pass = egui_wgpu_backend::RenderPass::new(&device, surface_format, 1);
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -351,7 +383,7 @@ impl State {
             }
         );
 
-
+        let start_time = Instant::now();
         Self {
             depth_texture,
             surface,
@@ -372,6 +404,9 @@ impl State {
             instance_buffer,
             instance_rot_speed: 1.,
             light,
+            ui_platform: platform,
+            ui_render_pass: egui_render_pass,
+            start_time,
         }
     }
 
@@ -431,7 +466,19 @@ impl State {
 
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        let output = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Outdated) => {
+                // This error occurs when the app is minimized on Windows.
+                // Silently return here to prevent spamming the console with:
+                // "The underlying surface has changed, and therefore the swap chain must be updated"
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Dropped frame with error: {}", e);
+                return Err(e);
+            }
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -485,8 +532,67 @@ impl State {
             );
         }
 
+        // Render The UI
+        self.ui_platform.update_time(self.start_time.elapsed().as_secs_f64());
+
+        let output_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Begin to draw the UI frame.
+        self.ui_platform.begin_frame();
+
+        // Draw a small windo into the application.
+        egui::Window::new("test window")
+            .default_size(egui::vec2(200., 200.))
+            .show(&self.ui_platform.context(), |ui| {
+                ui.label("This is a label");
+                ui.hyperlink("https://github.com/emilk/egui");
+            });
+
+        // End the UI frame. We could now handle the output and draw the UI with the backend.
+        let full_output = self.ui_platform.end_frame(Some(&self.window));
+        let paint_jobs = self.ui_platform.context().tessellate(full_output.shapes);
+
+        // Upload all resources for the GPU.
+        let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
+            physical_width: self.config.width,
+            physical_height: self.config.height,
+            scale_factor: self.window.scale_factor() as f32,
+        };
+        let tdelta: egui::TexturesDelta = full_output.textures_delta;
+        self.ui_render_pass
+            .add_textures(&self.device, &self.queue, &tdelta)
+            .expect("add texture ok");
+        self.ui_render_pass.update_buffers(&self.device, &self.queue, &paint_jobs, &screen_descriptor);
+
+        // Record all render passes.
+        self.ui_render_pass
+            .execute(
+                &mut encoder,
+                &output_view,
+                &paint_jobs,
+                &screen_descriptor,
+                None,
+            )
+            .unwrap();
+
+        // Submit the commands.
         self.queue.submit(iter::once(encoder.finish()));
+
+        // Redraw egui
         output.present();
+
+        self.ui_render_pass 
+            .remove_textures(tdelta)
+            .expect("remove texture ok");
+
+        // Support reactive on windows only, but not on linux.
+        // if _output.needs_repaint {
+        //     *control_flow = ControlFlow::Poll;
+        // } else {
+        //     *control_flow = ControlFlow::Wait;
+        // }
 
         Ok(())
     }
@@ -528,60 +634,65 @@ pub async fn run() {
     // State::new uses async code, so we're going to wait for it to finish
     let mut state = State::new(window).await;
     let mut last_render_time = Instant::now();
+    let start_time = last_render_time;
 
     event_loop.run(move |event, _, control_flow| {
-        match event {
-            Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta, }, .. } => if state.mouse_pressed {
-                state.observer_controlls.process_mouse_movement(delta.0, delta.1)
-            }
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == state.window().id() && !state.input(event) => {
-                if !state.input(event) {
-                    match event {
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            input:
-                                KeyboardInput {
-                                    state: ElementState::Pressed,
-                                    virtual_keycode: Some(VirtualKeyCode::Escape),
-                                    ..
-                                },
-                            ..
-                        } => *control_flow = ControlFlow::Exit,
-                        WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
+        state.ui_platform.handle_event(&event);
+        let ui_handles_event = state.ui_platform.captures_event(&event);
+        if !ui_handles_event {
+            match event {
+                Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta, }, .. } => if state.mouse_pressed {
+                    state.observer_controlls.process_mouse_movement(delta.0, delta.1)
+                }
+                Event::WindowEvent {
+                    ref event,
+                    window_id,
+                } if window_id == state.window().id() && !state.input(event) => {
+                    if !state.input(event) {
+                        match event {
+                            WindowEvent::CloseRequested
+                            | WindowEvent::KeyboardInput {
+                                input:
+                                    KeyboardInput {
+                                        state: ElementState::Pressed,
+                                        virtual_keycode: Some(VirtualKeyCode::Escape),
+                                        ..
+                                    },
+                                ..
+                            } => *control_flow = ControlFlow::Exit,
+                            WindowEvent::Resized(physical_size) => {
+                                state.resize(*physical_size);
+                            }
+                            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                                // new_inner_size is &mut so w have to dereference it twice
+                                state.resize(**new_inner_size);
+                            }
+                            _ => {}
                         }
-                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                            // new_inner_size is &mut so w have to dereference it twice
-                            state.resize(**new_inner_size);
-                        }
-                        _ => {}
                     }
                 }
-            }
-            Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-                let now = Instant::now();
-                let dt = now - last_render_time;
-                last_render_time = now;
-                state.update(dt);
-                match state.render() {
-                    Ok(_) => {}
-                    // Reconfigure the surface if it's lost or outdated
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => state.resize(state.size),
-                    // The system is out of memory, we should probably quit
-                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    // We're ignoring timeouts
-                    Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                Event::RedrawRequested(window_id) if window_id == state.window().id() => {
+                    let now = Instant::now();
+                    let dt = now - last_render_time;
+                    last_render_time = now;
+                    state.update(dt);
+                    match state.render() {
+                        Ok(_) => {}
+                        // Reconfigure the surface if it's lost or outdated
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => state.resize(state.size),
+                        // The system is out of memory, we should probably quit
+                        Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                        // We're ignoring timeouts
+                        Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                    }
                 }
+                Event::MainEventsCleared => {
+                    // RedrawRequested will only trigger once, unless we manually
+                    // request it.
+                    state.window().request_redraw();
+                }
+                _ => {}
             }
-            Event::MainEventsCleared => {
-                // RedrawRequested will only trigger once, unless we manually
-                // request it.
-                state.window().request_redraw();
-            }
-            _ => {}
         }
     });
 }

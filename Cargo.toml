@@ -13,7 +13,7 @@ log = "0.4"
 instant = "0.1"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
-wgpu = "0.15.1"
+wgpu = "0.16"
 winit = "0.28.2"
 cfg-if = "1"
 pollster = "0.3.0"
@@ -22,6 +22,10 @@ image = { version = "0.24.6", default-features = false, features = ["png", "jpeg
 anyhow = "1.0"
 cgmath = "0.18"
 tobj = { version = "3.2.1", features = [ "async", ]}
+egui_wgpu_backend = "0.24.0"
+egui_winit_platform = "0.19.0"
+egui = "0.22.0"
+epi = "0.17.0"
 
 [build-dependencies]
 anyhow = "1.0"
