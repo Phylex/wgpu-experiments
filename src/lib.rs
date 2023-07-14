@@ -1,18 +1,17 @@
 use std::iter;
 use instant::Instant;
 use cgmath::*;
-use observer::{ObserverControlls, Observer, Projection};
+use observer::Camera;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
-use egui_wgpu_backend;
 use egui_winit_platform::{Platform, PlatformDescriptor};
-use model::Vertex;
-use model::DrawModel;
+use model::{GPUVertex, DrawModel, Instance, GPUInstance};
 use egui::FontDefinitions;
+use crate::wgpu_utils::create_render_pipeline;
 
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
@@ -32,6 +31,7 @@ impl epi::backend::RepaintSignal for ExampleRepaintSignal {
     }
 }
 
+mod wgpu_utils;
 mod resources;
 mod model;
 mod texture;
@@ -40,127 +40,6 @@ mod light;
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
 
-struct Instance {
-    position: cgmath::Vector3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-}
-
-impl Instance {
-    fn to_raw(&self) -> RawInstance {
-        RawInstance{
-            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
-            scale: [1.0, 1.0, 1.0, 1.0],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct RawInstance {
-    model: [[f32; 4]; 4],
-    scale: [f32; 4],
-}
-
-impl RawInstance {
-    /// Generate the layout for the Vertex Buffer used to store the instance transformation matrix
-    /// on the gpu
-    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<RawInstance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
-                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We'll have to reassemble the mat4 in
-                // the shader.
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 6,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 7,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 8,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
-                    shader_location: 9,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
-        }
-    }
-}
-
-fn create_render_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    color_format: wgpu::TextureFormat,
-    depth_format: Option<wgpu::TextureFormat>,
-    vertex_layout: &[wgpu::VertexBufferLayout],
-    shader: wgpu::ShaderModuleDescriptor,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(shader);
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Render Pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: vertex_layout,
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // reduires Ferature DEPTH_CLIP_CONTROL
-            unclipped_depth: false,
-            // requires Feature::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-        depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
-            format,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: color_format,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent::REPLACE,
-                    alpha: wgpu::BlendComponent::REPLACE,
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview: None,
-    })
-}
 
 struct State {
     surface: wgpu::Surface,
@@ -172,10 +51,7 @@ struct State {
     light_render_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     window: Window,
-    observer: observer::Observer, 
-    observer_controlls: ObserverControlls,
-    observer_projection: Projection,
-    observer_uniform: observer::ObserverUniform,
+    observer: observer::Camera, 
     mouse_pressed: bool,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
@@ -286,12 +162,20 @@ impl State {
             });
 
 
-        // all the stuff that is needed to produce the camera in the scene
-        let observer = Observer::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection = Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
-        let observer_controlls = ObserverControlls::new(4.0, 0.4);
-        let mut observer_uniform = observer::ObserverUniform::new(&device);
-        observer_uniform.update(&observer, &projection, &queue);
+        // all the stuff that is needed to initialize the observer of the scene
+        let observer = Camera::new(
+            (0.0, 5.0, 10.0),
+            cgmath::Deg(-90.0),
+            cgmath::Deg(-20.0),
+            size.width,
+            size.height,
+            0.1,
+            100.0,
+            cgmath::Deg(45.0),
+            &device,
+            4.0, 0.4,
+            &queue
+        );
 
         let light = light::Light::new(&mut device);
 
@@ -307,7 +191,7 @@ impl State {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[
                     &texture_bind_group_layout,
-                    &observer_uniform.bind_group_layout,
+                    &observer.uniform.bind_group_layout,
                     &light.bind_group_layout,
                 ],
                 push_constant_ranges: &[],
@@ -323,7 +207,7 @@ impl State {
                 &render_pipeline_layout,
                 config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
-                &[model::ModelVertex::desc(), RawInstance::desc()],
+                &[model::ModelVertex::desc(), GPUInstance::desc()],
                 shader,
             )
         };
@@ -331,7 +215,7 @@ impl State {
         let light_render_pipeline = {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Light Render Pipeline"),
-                bind_group_layouts: &[&observer_uniform.bind_group_layout, &light.bind_group_layout],
+                bind_group_layouts: &[&observer.uniform.bind_group_layout, &light.bind_group_layout],
                 push_constant_ranges: &[],
             });
             let shader = wgpu::ShaderModuleDescriptor {
@@ -374,7 +258,7 @@ impl State {
                 }
             })
         }).collect::<Vec<_>>();
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_data = instances.iter().map(Instance::to_shader_format).collect::<Vec<_>>();
         let instance_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Instance Buffer"),
@@ -396,9 +280,6 @@ impl State {
             obj_model,
             window,
             observer,
-            observer_uniform,
-            observer_controlls,
-            observer_projection: projection,
             mouse_pressed: false,
             instances,
             instance_buffer,
@@ -420,33 +301,29 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.observer_projection.resize(new_size.width, new_size.height);
+            self.observer.projection.resize(new_size.width, new_size.height);
             self.depth_texture = texture::Texture::create_depth_texture(&self.device, &self.config, "depth texture")
         }
     }
 
     #[allow(unused_variables)]
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::KeyboardInput {
-                input: KeyboardInput { state, virtual_keycode: Some(key), ..},
-                ..
-            } => self.observer_controlls.process_keyboard_input(*key, *state),
-            WindowEvent::MouseWheel {delta, ..} => {
-                self.observer_controlls.process_scroll(delta);
-                true
-            },
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.mouse_pressed = *state == ElementState::Pressed;
-                true
+    fn input(&mut self, event: &Event<()>) -> bool {
+        let event_processed = self.observer.controlls.process_event(event, self.mouse_pressed, self.window().id());
+        if !event_processed {
+            match event {
+                Event::WindowEvent {event: WindowEvent::MouseInput { state, button: MouseButton::Left, .. }, ..} => {
+                    self.mouse_pressed = *state == ElementState::Pressed;
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        } else {
+            true
         }
     }
 
     fn update(&mut self, dt: instant::Duration) {
-        self.observer_controlls.update_observer(&mut self.observer, dt);
-        self.observer_uniform.update(&self.observer, &self.observer_projection, &self.queue);
+        self.observer.update(dt, &self.queue);
 
         // update the instances to rotate
         self.instances = self.instances.iter().map(|i| {
@@ -456,7 +333,7 @@ impl State {
                 rotation: new_rot,
             }
         }).collect::<Vec<_>>();
-        let instance_data = self.instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_data = self.instances.iter().map(Instance::to_shader_format).collect::<Vec<_>>();
         // write the rotations to the buffer
         self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
 
@@ -519,7 +396,7 @@ impl State {
             render_pass.set_pipeline(&self.light_render_pipeline);
             render_pass.draw_light_model(
                 &self.obj_model,
-                &self.observer_uniform.bind_group,
+                &self.observer.uniform.bind_group,
                 &self.light.bind_group
             );
 
@@ -527,7 +404,7 @@ impl State {
             render_pass.draw_model_instanced(
                 &self.obj_model,
                 0..self.instances.len() as u32,
-                &self.observer_uniform.bind_group,
+                &self.observer.uniform.bind_group,
                 &self.light.bind_group
             );
         }
@@ -634,21 +511,23 @@ pub async fn run() {
     // State::new uses async code, so we're going to wait for it to finish
     let mut state = State::new(window).await;
     let mut last_render_time = Instant::now();
-    let start_time = last_render_time;
 
+    // This is where events are processed and the resulting frames rendered
+    // as the name suggests, this is done in a loop
     event_loop.run(move |event, _, control_flow| {
         state.ui_platform.handle_event(&event);
-        let ui_handles_event = state.ui_platform.captures_event(&event);
-        if !ui_handles_event {
-            match event {
-                Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta, }, .. } => if state.mouse_pressed {
-                    state.observer_controlls.process_mouse_movement(delta.0, delta.1)
-                }
-                Event::WindowEvent {
-                    ref event,
-                    window_id,
-                } if window_id == state.window().id() && !state.input(event) => {
-                    if !state.input(event) {
+        let event_handeled_by_ui = state.ui_platform.captures_event(&event);
+        if !event_handeled_by_ui {
+            let event_handeled_by_app = state.input(&event);
+            if !event_handeled_by_app {
+                match event {
+                    Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta, }, .. } => if state.mouse_pressed {
+                        state.observer.controlls.process_mouse_movement(delta.0, delta.1)
+                    }
+                    Event::WindowEvent {
+                        ref event,
+                        window_id,
+                    } if window_id == state.window().id() => {
                         match event {
                             WindowEvent::CloseRequested
                             | WindowEvent::KeyboardInput {
@@ -670,28 +549,28 @@ pub async fn run() {
                             _ => {}
                         }
                     }
-                }
-                Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-                    let now = Instant::now();
-                    let dt = now - last_render_time;
-                    last_render_time = now;
-                    state.update(dt);
-                    match state.render() {
-                        Ok(_) => {}
-                        // Reconfigure the surface if it's lost or outdated
-                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => state.resize(state.size),
-                        // The system is out of memory, we should probably quit
-                        Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                        // We're ignoring timeouts
-                        Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                    Event::RedrawRequested(window_id) if window_id == state.window().id() => {
+                        let now = Instant::now();
+                        let dt = now - last_render_time;
+                        last_render_time = now;
+                        state.update(dt);
+                        match state.render() {
+                            Ok(_) => {}
+                            // Reconfigure the surface if it's lost or outdated
+                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => state.resize(state.size),
+                            // The system is out of memory, we should probably quit
+                            Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                            // We're ignoring timeouts
+                            Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                        }
                     }
+                    Event::MainEventsCleared => {
+                        // RedrawRequested will only trigger once, unless we manually
+                        // request it.
+                        state.window().request_redraw();
+                    }
+                    _ => {}
                 }
-                Event::MainEventsCleared => {
-                    // RedrawRequested will only trigger once, unless we manually
-                    // request it.
-                    state.window().request_redraw();
-                }
-                _ => {}
             }
         }
     });
