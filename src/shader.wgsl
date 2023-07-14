@@ -1,4 +1,5 @@
-// Vertex shader
+// We (re)define the structs that are bound to the shader
+// this corresponds to the mapping in the bind groups
 struct Observer {
     view_proj: mat4x4<f32>,
     position: vec4<f32>,
@@ -35,7 +36,8 @@ struct Light {
     color: vec3<f32>,
 }
 
-
+// Here the vertex shader is doing pretty boring stuff, it simply maps the points into the view volume
+// via transforming 
 @vertex
 fn vs_main(
     model: VertexInput,
@@ -55,9 +57,15 @@ fn vs_main(
     );
     var out: VertexOutput;
     out.tex_coords = model.tex_coords;
+    
+    // translate the 3d vectors for position and normal to homogenious coordinates
+    // also calculate the vectors in the "world coordinate system"
+    // this is needed for calculating the lighting in the fragment shader
     out.world_normal = (inverse_scale_matrix * instance_transform * vec4<f32>(model.normal, 0.0)).xyz;
     var world_position: vec4<f32> = instance_transform * vec4<f32>(model.position, 1.0);
     out.position = world_position.xyz;
+
+    // this is the thing that really matters to the clipping and rasterization process
     out.clip_position = observer.view_proj * world_position;
     return out;
 }
