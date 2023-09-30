@@ -1,11 +1,15 @@
-use bytemuck;
 use core::ops::Range;
+use std::collections::HashMap;
 use crate::texture;
 
 pub trait GPUVertex {
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a>;
 }
 
+/// Struct that represents the Model Vertices on the GPU
+/// This struct is used to model the GPU data programatically
+/// The ModelVertex struct never lives in Main memory but is
+/// copied into GPURAM immediately.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ModelVertex {
@@ -47,11 +51,21 @@ pub struct Material {
     pub bind_group: wgpu::BindGroup,
 }
 
-pub struct Model {
+/// The structure representing an asset in a scene. It contains the 3D geomtry of the thing
+/// along with the Materials that it is made up of. One Mesh can only be linked to one material.
+/// Something like a charackter in a game would consist of many different meshes that map to
+/// different materials.
+/// To create a visible thing in the scene an object must be instanced. The object itself is
+/// immutable while the instance may be modified through the duration of the scene.
+pub struct Object {
     pub meshes: Vec<Mesh>,
     pub materials: Vec<Material>,
 }
 
+/// The Mesh is the struct that manages the GPU memory associated with the Mesh Data.
+/// The Mesh data is assumed to be layed out accorduing to the MeshVertex data layout.
+/// The Material link is the index of the shader bind group containing the corresponding
+/// Material mesh
 pub struct Mesh {
     pub name: String,
     pub vertex_buffer: wgpu::Buffer,
@@ -60,17 +74,22 @@ pub struct Mesh {
     pub material: usize,
 }
 
-// This is the description of the instance of a model
+/// This is the description of the instance of a model. Instances will be the things
+/// that will be modifiable from the mathematical "model" of the scene
 pub struct Instance {
     pub position: cgmath::Vector3<f32>,
     pub rotation: cgmath::Quaternion<f32>,
+    pub scale: cgmath::Vector3<f32>
 }
 
+/// Construct the Data that is sent to the GPU from the Main Memmory representation
+/// The instances are kept in Main memory as they are expected to be modified by the mathematical
+/// model that animates the scene
 impl Instance {
     pub fn to_shader_format(&self) -> GPUInstance {
         GPUInstance{
-            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
-            scale: [1.0, 1.0, 1.0, 1.0],
+            rotlate: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into(),
+            scale: [self.scale.x, self.scale.y, self.scale.z, 1.0],
         }
     }
 }
@@ -78,7 +97,7 @@ impl Instance {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GPUInstance {
-    model: [[f32; 4]; 4],
+    rotlate: [[f32; 4]; 4],
     scale: [f32; 4],
 }
 
@@ -145,13 +164,13 @@ pub trait DrawModel<'a> {
 
     fn draw_model(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
     );
     fn draw_model_instanced(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         instances: Range<u32>,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
@@ -189,7 +208,7 @@ impl<'a, 'b> DrawModel<'b> for wgpu::RenderPass<'a>
 
     fn draw_model(
         &mut self,
-        model: &'b Model,
+        model: &'b Object,
         camera_bind_group: &'b wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
     ) {
@@ -198,7 +217,7 @@ impl<'a, 'b> DrawModel<'b> for wgpu::RenderPass<'a>
 
     fn draw_model_instanced(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         instances: Range<u32>,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
@@ -227,13 +246,13 @@ pub trait DrawLight<'a> {
     );
     fn draw_light_model(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
     );
     fn draw_light_model_instanced(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         instance: Range<u32>,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
@@ -267,7 +286,7 @@ where
     }
     fn draw_light_model(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
     ) {
@@ -275,7 +294,7 @@ where
     }
     fn draw_light_model_instanced(
         &mut self,
-        model: &'a Model,
+        model: &'a Object,
         instances: Range<u32>,
         camera_bind_group: &'a wgpu::BindGroup,
         light_bind_group: &'a wgpu::BindGroup,
@@ -286,3 +305,9 @@ where
     }
 }
 
+struct Scene {
+    name: String,
+    objects: Vec<Object>,
+    instances: HashMap<Object, Vec<Instance>>,
+
+}

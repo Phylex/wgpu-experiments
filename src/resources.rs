@@ -71,7 +71,7 @@ pub async fn load_model(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-) -> anyhow::Result<model::Model> {
+) -> anyhow::Result<model::Object> {
     let obj_text = load_string(file_name).await?;
     let obj_cursor = Cursor::new(obj_text);
     let mut obj_reader = BufReader::new(obj_cursor);
@@ -150,6 +150,6 @@ pub async fn load_model(
             
         }
     }).collect::<Vec<_>>();
-    Ok(model::Model { meshes, materials })
+    Ok(model::Object { meshes, materials })
 }
 

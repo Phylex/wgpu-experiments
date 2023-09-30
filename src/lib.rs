@@ -12,6 +12,7 @@ use egui_winit_platform::{Platform, PlatformDescriptor};
 use model::{GPUVertex, DrawModel, Instance, GPUInstance};
 use egui::FontDefinitions;
 use crate::wgpu_utils::create_render_pipeline;
+use std::iter::zip;
 
 #[cfg(target_arch="wasm32")]
 use wasm_bindgen::prelude::*;
@@ -40,7 +41,6 @@ mod light;
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
 
-
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -56,16 +56,18 @@ struct State {
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     instance_rot_speed: f32,
-    obj_model: model::Model,
+    obj_model: model::Object,
     depth_texture: texture::Texture,
     light: light::Light,
     ui_platform: Platform,
     ui_render_pass: egui_wgpu_backend::RenderPass,
     start_time: Instant,
+    spacing: f32,
 }
 
 impl State {
     async fn new(window: Window) -> Self {
+        let spacing: f32 = 2.;
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -76,7 +78,6 @@ impl State {
         });
         
         // # Safety
-        //
         // The surface needs to live as long as the window that created it.
         // State owns the window so this should be safe.
         let surface = unsafe { instance.create_surface(&window) }.unwrap();
@@ -109,6 +110,7 @@ impl State {
             .unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
+        
         // Shader code in this tutorial assumes an Srgb surface texture. Using a different
         // one will result all the colors comming out darker. If you want to support non
         // Srgb surfaces, you'll need to account for that when drawing to the frame.
@@ -233,11 +235,10 @@ impl State {
         
         // this is effectively a somewhat fancy way of generating a list of instances
         // using generators and iterator mechanics
-        const SPACE_BETWEEN: f32 = 3.0;
         let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
             (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
-                let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let x = spacing * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let z = spacing * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
                 let position = cgmath::Vector3 { x, y: 0.0, z };
 
                 let rotation = if position.is_zero() {
@@ -249,7 +250,7 @@ impl State {
                 };
 
                 Instance {
-                    position, rotation,
+                    position, rotation, scale: [1.0, 1.0, 1.0].into()
                 }
             })
         }).collect::<Vec<_>>();
@@ -283,6 +284,7 @@ impl State {
             ui_platform: platform,
             ui_render_pass: egui_render_pass,
             start_time,
+            spacing,
         }
     }
 
@@ -317,17 +319,30 @@ impl State {
         }
     }
 
+    fn update_instances(&mut self, dt: instant::Duration) {
+        let spacing = self.spacing;
+        let positions = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
+            (0..NUM_INSTANCES_PER_ROW).map(move |x| {
+                let x = spacing * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                let z = spacing * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
+                cgmath::Vector3 { x, y: 0.0, z }
+            })
+        }).collect::<Vec<_>>();
+        self.instances = zip(&self.instances, positions).map(|(inst, pos)| {
+            let new_rot = inst.rotation * cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(10.0 * dt.as_secs_f32() * self.instance_rot_speed));
+            Instance {
+                position: pos,
+                rotation: new_rot,
+                scale: [1.0, 1.0, 1.0].into(),
+            }
+        }).collect::<Vec<_>>();
+    }
+
     fn update(&mut self, dt: instant::Duration) {
         self.observer.update(dt, &self.queue);
 
         // update the instances to rotate
-        self.instances = self.instances.iter().map(|i| {
-            let new_rot = i.rotation * cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(10.0 * dt.as_secs_f32() * self.instance_rot_speed));
-            Instance {
-                position: i.position,
-                rotation: new_rot,
-            }
-        }).collect::<Vec<_>>();
+        self.update_instances(dt);
         let instance_data = self.instances.iter().map(Instance::to_shader_format).collect::<Vec<_>>();
         // write the rotations to the buffer
         self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
@@ -420,6 +435,7 @@ impl State {
             .show(&self.ui_platform.context(), |ui| {
                 ui.label("This is a label");
                 ui.hyperlink("https://github.com/emilk/egui");
+                ui.add(egui::Slider::new(&mut self.spacing, 2.0..=10.).text("spacing"));
             });
 
         // End the UI frame. We could now handle the output and draw the UI with the backend.
